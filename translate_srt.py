@@ -34,9 +34,17 @@ from google import genai
 from google.genai import types
 
 MODEL = "gemini-3.5-flash"  # current GA flash model as of mid-2026; override with --model if this changes again
-CHUNK_SIZE = 40              # subtitle cues per chunk
+CHUNK_SIZE = 100             # subtitle cues per chunk (was 40 — bigger batches mean fewer
+                              # round trips, and the truncation-retry logic below already
+                              # recovers any lines a big batch cuts off, so this is low-risk)
 CONTEXT_TAIL = 4             # how many previous translated lines to show for continuity
 FLAG_SIMILARITY_THRESHOLD = 0.55  # below this draft<->refined similarity, flag for human review
+PACING_DELAY = 1.5           # seconds to sleep after each successful call, as a courtesy buffer
+                              # below the RPM limit. This is NOT what protects you from real
+                              # rate limits — call_gemini()'s exponential backoff on 429s does
+                              # that reactively. This is just insurance to avoid bursting.
+                              # Override with --pacing-delay (e.g. 0 to disable, or higher if
+                              # you're on the free tier's 15 RPM cap and still see 429s).
 
 
 def significant_change(draft: str, refined: str) -> bool:
@@ -129,6 +137,7 @@ def call_gemini(client: genai.Client, prompt: str, max_retries: int = 6) -> str:
     """Call Gemini with JSON output mode. Distinguishes between:
     - per-minute/per-token limits (transient, worth backing off and retrying)
     - per-day limits (won't clear until midnight Pacific Time, no point retrying)
+    - 503 model-overloaded errors (transient server-side, worth backing off and retrying)
     Adds a small pacing delay after every successful call to avoid bursting RPM."""
     delay = 3
     use_thinking_config = True
@@ -159,7 +168,8 @@ def call_gemini(client: genai.Client, prompt: str, max_retries: int = 6) -> str:
                 except Exception:
                     pass
                 raise RuntimeError(f"EMPTY_RESPONSE (finish_reason={finish_reason}, block_reason={block_reason})")
-            time.sleep(4)  # simple pacing so we don't burst past RPM even on fast responses
+            if PACING_DELAY > 0:
+                time.sleep(PACING_DELAY)  # small courtesy buffer, not the real rate-limit defense
             return resp.text
         except Exception as e:
             msg = str(e)
@@ -191,13 +201,20 @@ def call_gemini(client: genai.Client, prompt: str, max_retries: int = 6) -> str:
                 time.sleep(delay)
                 delay = min(delay * 2, 90)
                 continue
+            if "503" in msg or "UNAVAILABLE" in msg or "overloaded" in msg.lower():
+                # transient server-side overload, not a quota issue — same backoff-and-retry
+                # treatment as a per-minute rate limit, just a different cause.
+                print(f"  [model overloaded (503), waiting {delay}s and retrying...]")
+                time.sleep(delay)
+                delay = min(delay * 2, 90)
+                continue
             raise
     raise QuotaExhaustedError(
-        "Repeated rate-limit errors that didn't clear after several backoff attempts. "
-        "This usually means the per-minute window is unusually congested, or the daily "
-        "quota is exhausted but wasn't clearly labeled. Progress so far is saved — wait "
-        "a few minutes (or until midnight Pacific Time if it's the daily cap) and re-run "
-        "the same command to resume."
+        "Repeated errors (rate-limit or model-overloaded) that didn't clear after several "
+        "backoff attempts. This usually means the per-minute window is unusually congested, "
+        "the model is having a rough patch, or the daily quota is exhausted but wasn't clearly "
+        "labeled. Progress so far is saved — wait a few minutes (or until midnight Pacific Time "
+        "if it's the daily cap) and re-run the same command to resume."
     )
 
 
@@ -569,11 +586,16 @@ def review_flagged(flagged_items, refined_by_id, draft_by_id, state):
 # ---------------------------------------------------------------------------
 
 def main():
-    global FLAG_SIMILARITY_THRESHOLD, MODEL
+    global FLAG_SIMILARITY_THRESHOLD, MODEL, PACING_DELAY
     ap = argparse.ArgumentParser(description="Translate an English .srt or .ass/.ssa subtitle file to Burmese via Gemini, semi-interactively.")
     ap.add_argument("input_srt", nargs="?")
     ap.add_argument("output_srt", nargs="?")
     ap.add_argument("--chunk-size", type=int, default=CHUNK_SIZE)
+    ap.add_argument("--pacing-delay", type=float, default=PACING_DELAY,
+                     help=f"Seconds to sleep after each successful API call (default: {PACING_DELAY}). "
+                          "Real rate-limit protection is the exponential backoff on 429s below — this is "
+                          "just a courtesy buffer. Set to 0 to remove it entirely, or raise it if you're "
+                          "on a low-RPM free-tier key and still hitting 429s.")
     ap.add_argument("--flag-threshold", type=float, default=FLAG_SIMILARITY_THRESHOLD,
                      help="Lower = stricter (more lines flagged for review). Default 0.55.")
     ap.add_argument("--model", default=MODEL,
@@ -594,6 +616,7 @@ def main():
     args = ap.parse_args()
     FLAG_SIMILARITY_THRESHOLD = args.flag_threshold
     MODEL = args.model
+    PACING_DELAY = args.pacing_delay
 
     # --- key management commands (no srt file needed) ---
     if args.save_key:
